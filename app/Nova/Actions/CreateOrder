@@ -1,0 +1,693 @@
+<?php
+
+namespace App\Nova\Actions;
+
+use App\Jobs\AutoAssignNumbers;
+use App\Mail\NewOrderNotification;
+use App\Models\Number as ModelsNumber;
+use App\Models\Order;
+use App\Models\User;
+use Illuminate\Bus\Queueable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Laravel\Nova\Actions\Action;
+use Laravel\Nova\Fields\ActionFields;
+use Laravel\Nova\Fields\Boolean;
+use Laravel\Nova\Fields\Currency;
+use Laravel\Nova\Fields\Heading;
+use Laravel\Nova\Fields\Number;
+use Laravel\Nova\Fields\Select;
+use Laravel\Nova\Http\Requests\NovaRequest;
+use Laravel\Nova\Notifications\NovaNotification;
+use Laravel\Nova\URL as NovaURL;
+
+class CreateOrder extends Action
+{
+    use InteractsWithQueue;
+    use Queueable;
+
+    protected const MAX_ROWS = 5;
+
+    public function handle(ActionFields $fields, Collection $models)
+    {
+        $authUser = Auth::user();
+
+        // ── Determine Buyer ───────────────────────────────────────────────────
+        $userId = $fields->buyer;
+        if ($authUser->role == User::USER_ROLE) {
+            $userId = $authUser->id;
+        } else if ($authUser->role == User::SELLER_ROLE) {
+            $userId = $authUser->id;
+        }
+
+
+        if (!$userId) {
+            return Action::danger('User not found.');
+        }
+
+        $createdOrders = [];
+        $failedRows    = [];
+
+        for ($i = 1; $i <= self::MAX_ROWS; $i++) {
+
+            $carrierId = $fields->{'carrier_' . $i};
+            $areaId    = $fields->{'area_' . $i};
+            $quantity  = (int) ($fields->{'quantity_' . $i} ?? 0);
+
+            // Both empty — user did not fill this line at all, skip silently
+            if (!$carrierId && !$areaId) {
+                continue;
+            }
+
+            // Partially filled or quantity missing — report error
+            if (!$carrierId || !$areaId || $quantity < 1) {
+                $failedRows[] = "Line {$i}: Please fill Carrier, Area and Quantity.";
+                continue;
+            }
+
+            // ── Carrier load ──────────────────────────────────────────────────
+            $carrier = \App\Models\Carrier::find($carrierId);
+
+            if (!$carrier) {
+                $failedRows[] = "Line {$i}: Carrier not found.";
+                continue;
+            }
+
+            $defaultCarrierPrice = (float) $carrier->price;
+
+            // ── Buyer carrier rules ───────────────────────────────────────────
+            $userCarrier = \App\Models\UserCarrier::where('user_id', $userId)
+                ->where('carrier_id', $carrierId)
+                ->first(['blocked', 'rate']);
+
+            if (!$userCarrier) {
+                $userCarrier = \App\Models\UserCarrier::where('user_id', $authUser->parent_user_id)
+                    ->where('carrier_id', $carrierId)
+                    ->first(['blocked', 'rate']);
+            }
+
+            if ($userCarrier && $userCarrier->blocked) {
+                $failedRows[] = "Line {$i}: This carrier is not available for your account.";
+                continue;
+            }
+
+            // Custom rate > 0 → use it, otherwise carrier default
+            $effectiveUnitPrice = ($userCarrier && $userCarrier->rate > 0)
+                ? (float) $userCarrier->rate
+                : $defaultCarrierPrice;
+
+            // ── Fetch available numbers ───────────────────────────────────────
+            // Determine kaun sa admin hai jiske numbers assign hone chahiye
+            $numberOwnerUserId = null;
+            $buyer = User::find($userId);
+            $parent = null;
+            if ($buyer) {
+
+                // Case 1: buyer ka parent hai
+                if ($buyer->parent_user_id) {
+
+                    $parent = User::find($buyer->parent_user_id);
+
+                    //  NEW CONDITION
+                    // agar parent bhi buyer hai (ya self parent case)
+                    if (
+                        $parent &&
+                        (
+                            $parent->role === User::USER_ROLE ||
+                            $parent->id === $buyer->id
+                        )
+                    ) {
+                        //  super admin ke numbers
+                        $superAdmin = User::IsSuperAdminRole()->first();
+                        $numberOwnerUserId = $superAdmin?->id;
+                    } else {
+                        //  seller ke numbers
+                        $numberOwnerUserId = $buyer->parent_user_id;
+                    }
+                } else {
+                    //  Case 2: no parent → super admin
+                    $superAdmin = User::IsSuperAdminRole()->first();
+                    $numberOwnerUserId = $superAdmin?->id;
+                }
+            }
+
+
+
+            $scopeMethod = ($parent?->role == User::SELLER_ROLE) ? 'isSellerNotUsed' : 'isNotUsed';
+
+            $numbers = ModelsNumber::$scopeMethod()
+                ->where('carrier_id', $carrierId)
+                ->where('area_id', $areaId)
+                ->isNotExpired()
+                ->where('user_id', $numberOwnerUserId)
+                ->orderBy('expiry', 'asc')
+                ->limit($quantity)
+                ->get();
+
+
+            $numberIds  = $numbers->pluck('id')->toArray();
+            $successQty = count($numberIds);
+
+            // ── Billing (all at buyer's effective price) ──────────────────────
+            $subtotal = $successQty * $effectiveUnitPrice;
+            $total    = $quantity   * $effectiveUnitPrice;
+
+
+            // ── Create order ──────────────────────────────────────────────────
+            $order              = new Order();
+            $order->user_id     = $userId;
+            $order->carrier_id  = $carrierId;
+            $order->city_id     = null;
+            $order->area_id     = $areaId;
+            $order->price       = $effectiveUnitPrice;
+            $order->order_type  = Order::ORDER_TYPE_BUY;
+            $order->total_qty   = $quantity;
+            $order->success_qty = $successQty;
+            $order->subtotal    = $subtotal;
+            $order->total       = $total;
+            $order->status      = ($successQty === $quantity)
+                ? Order::STATUS_COMPLETED
+                : Order::STATUS_PENDING;
+
+            $order->save();
+
+            // ── Assign numbers ────────────────────────────────────────────────
+            if ($successQty > 0) {
+                $order->numbers()->sync($numberIds);
+                if ($parent && $parent->id == $numberOwnerUserId) {
+                    ModelsNumber::whereIn('id', $numberIds)->update(['seller_is_used' => true]);
+                } else {
+                    if ($buyer->role != User::USER_ROLE) {
+                        ModelsNumber::whereIn('id', $numberIds)->update([
+                            'user_id' => $buyer->id,
+                            'is_used' => true
+                        ]);
+
+                        AutoAssignNumbers::dispatch();
+                    }
+
+                    ModelsNumber::whereIn('id', $numberIds)->update(['is_used' => true]);
+                }
+            }
+
+            $createdOrders[] = $order;
+        }
+
+        // ── No line was filled at all ─────────────────────────────────────────
+        if (empty($createdOrders) && empty($failedRows)) {
+            return Action::danger('Please fill at least one order line.');
+        }
+
+
+        // ── Notifications (only when a buyer places the order) ────────────────
+        if ($authUser->role == User::USER_ROLE || $authUser->role == User::SELLER_ROLE && count($createdOrders) > 0) {
+
+            $superAdmin = User::IsSuperAdminRole()->first();
+
+            if ($superAdmin) {
+                $count = count($createdOrders);
+                $superAdmin->notify(
+                    NovaNotification::make()
+                        ->message("{$count} new order(s) created by " . $authUser->name)
+                        ->action('View Orders', NovaURL::remote('/dashboard/resources/orders'))
+                        ->icon('info')
+                        ->type('success')
+                );
+
+                foreach ($createdOrders as $createdOrder) {
+                    try {
+                        Mail::send(new NewOrderNotification(
+                            config('app.url') . '/dashboard/resources/orders/' . $createdOrder->id
+                        ));
+                    } catch (\Exception $e) {
+                        Log::error('Order email error: ' . $e->getMessage());
+                    }
+                }
+            }
+        }
+
+        // ── Final response ────────────────────────────────────────────────────
+        if (empty($createdOrders)) {
+            return Action::danger('No order was created. ' . implode(' | ', $failedRows));
+        }
+
+        $msg = count($createdOrders) . ' order created successfully.';
+        if (!empty($failedRows)) {
+            $msg .= ' Skipped: ' . implode(' | ', $failedRows);
+        }
+
+        return Action::message($msg);
+    }
+
+    public function fields(NovaRequest $request): array
+    {
+        $user    = $request->user();
+        $isAdmin = in_array($user->role, [
+            User::SUPER_ADMINISTRATOR_ROLE,
+            User::NTS_ADMINISTRATOR_ROLE,
+        ]);
+        $buyerId = $isAdmin ? null : ($user->id);
+
+        $area = \App\Models\Area::isActive()->pluck('name', 'id');
+
+        // Admin sees all carriers; buyer sees only non-blocked carriers
+        if ($isAdmin) {
+            $carriers = \App\Models\Carrier::isActive()->pluck('name', 'id');
+        } else {
+
+            // Check if user parent exist
+            $user = $request->user();
+            $hasParent = $user->parent_user_id ? true : false;
+
+            // feteh parent blocked carrier ids
+            $parentBlockedCarrierIds = collect();
+            if ($hasParent) {
+                $parentBlockedCarrierIds = DB::table('user_carriers')
+                    ->where('user_id', $user->parent_user_id)
+                    ->where('blocked', true)
+                    ->pluck('carrier_id');
+            }
+
+            $carriers = \App\Models\Carrier::isActive()
+                ->where(function ($query) use ($buyerId) {
+                    // Apne blocked carriers exclude karo
+                    $query->whereDoesntHave('users', function ($q) use ($buyerId) {
+                        $q->where('users.id', $buyerId)
+                            ->where('user_carriers.blocked', true);
+                    });
+                })
+                // Parent ke blocked carriers bhi exclude karo
+                ->when($parentBlockedCarrierIds->isNotEmpty(), function ($query) use ($parentBlockedCarrierIds) {
+                    $query->whereNotIn('id', $parentBlockedCarrierIds);
+                })
+                ->pluck('name', 'id');
+        }
+
+        $fields = [];
+
+        // ── Buyer (admin only) ────────────────────────────────────────────────
+        $fields[] = Select::make('Buyer', 'buyer')
+            ->options(User::isBuyerRole()->isActive()->pluck('name', 'id'))
+            ->searchable()
+            ->displayUsingLabels()
+            ->fullWidth()
+            ->nullable()
+            ->canSee(fn($req) => in_array($req->user()->role, [
+                User::SUPER_ADMINISTRATOR_ROLE,
+                User::NTS_ADMINISTRATOR_ROLE,
+            ]));
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ORDER LINE 1 — always visible
+        // ══════════════════════════════════════════════════════════════════════
+
+        $fields[] = Select::make('Carrier', 'carrier_1')
+            ->options($carriers)
+            ->searchable()
+            ->displayUsingLabels()
+            ->fullWidth()
+            ->rules('required');
+
+        $fields[] = Currency::make('Carrier Price', 'carrier_price_1')
+            ->fullWidth()
+            ->symbol('USD')
+            ->dependsOn(
+                ['carrier_1', 'buyer'],
+                function (Currency $f, NovaRequest $r, $data) use ($isAdmin, $buyerId) {
+
+                    $carrierId = $data->carrier_1 ?? null;
+                    if (!$carrierId) {
+                        $f->hide();
+                        return;
+                    }
+
+                    $carrier = \App\Models\Carrier::find($carrierId);
+                    if (!$carrier) {
+                        $f->hide();
+                        return;
+                    }
+
+                    //  Resolve buyer
+                    $resolvedBuyerId = $isAdmin ? ($data->buyer ?? null) : $buyerId;
+                    if (!$resolvedBuyerId) {
+                        $f->hide();
+                        return;
+                    }
+
+                    $buyer = User::find($resolvedBuyerId);
+                    if (!$buyer) {
+                        $f->hide();
+                        return;
+                    }
+
+
+                    //  STEP 1: Check child buyer custom rate
+                    $uc = \App\Models\UserCarrier::where('user_id', $buyer->id)
+                        ->where('carrier_id', $carrier->id)
+                        ->first();
+
+                    if ($uc && $uc->rate > 0) {
+                        $price = (float) $uc->rate;
+                    } else {
+
+                        // STEP 2: Check parent (both direct buyer or seller admin)
+                        if ($buyer->parent_user_id) {
+
+                            $parentRate = \App\Models\UserCarrier::where('user_id', $buyer->parent_user_id)
+                                ->where('carrier_id', $carrier->id)
+                                ->first();
+
+                            if ($parentRate && $parentRate->rate > 0) {
+                                $price = (float) $parentRate->rate;
+                            } else {
+                                // ✅ STEP 3: Default carrier price
+                                $price = (float) $carrier->price;
+                            }
+                        } else {
+                            // direct buyer → no parent
+                            $price = (float) $carrier->price;
+                        }
+                    }
+
+                    $f->withMeta([
+                        'value' => $price,
+                        'readonly' => true
+                    ])->show();
+                }
+            );
+
+        $fields[] = Select::make('Area', 'area_1')
+            ->options($area)
+            ->searchable()
+            ->displayUsingLabels()
+            ->fullWidth()
+            ->rules('required');
+
+        $fields[] = Number::make('Quantity', 'quantity_1')
+            ->default(1)
+            ->min(1)
+            ->fullWidth()
+            ->rules(['required', 'min:1']);
+
+        // $fields[] = Boolean::make('Add Order', 'add_line_1')
+        //     ->fullWidth()
+        //     ->dependsOn(['add_line_2'], function (Boolean $f, NovaRequest $r, $data) {
+        //         if ($data->add_line_2 ?? false) {
+        //             $f->hide();
+        //         }
+        //     });
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ORDER LINE 2
+        // ══════════════════════════════════════════════════════════════════════
+        // $fields[] = Heading::make($this->lineHeadingHtml(2))->asHtml()
+        //     ->dependsOn(['add_line_1'], function (Heading $f, NovaRequest $r, $data) {
+        //         if (!($data->add_line_1 ?? false)) $f->hide();
+        //     });
+
+        // $fields[] = Select::make('Carrier', 'carrier_2')
+        //     ->options($carriers)->searchable()->displayUsingLabels()->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_1'], function (Select $f, NovaRequest $r, $data) {
+        //         ($data->add_line_1 ?? false) ? $f->show()->rules('required') : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Currency::make('Carrier Price', 'carrier_price_2')
+        //     ->fullWidth()
+        //     ->symbol('USD')
+        //     ->dependsOn(
+        //         ['add_line_1', 'carrier_2', 'buyer'],
+        //         function (Currency $f, NovaRequest $r, $data) use ($isAdmin, $buyerId) {
+        //             if (!($data->add_line_1 ?? false)) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+        //             $carrierId = $data->carrier_2 ?? null;
+        //             if (!$carrierId) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+
+        //             $carrier = \App\Models\Carrier::find($carrierId);
+        //             if (!$carrier) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+
+        //             $resolvedBuyerId = $isAdmin ? ($data->buyer ?? null) : $buyerId;
+        //             $price           = (float) $carrier->price;
+
+        //             if ($resolvedBuyerId) {
+        //                 $uc = \App\Models\UserCarrier::where('user_id', $resolvedBuyerId)
+        //                     ->where('carrier_id', $carrier->id)
+        //                     ->first(['rate']);
+        //                 if ($uc && $uc->rate > 0) {
+        //                     $price = (float) $uc->rate;
+        //                 }
+        //             }
+
+        //             $f->withMeta(['value' => $price, 'readonly' => true])->show();
+        //         }
+        //     );
+
+        // $fields[] = Select::make('City', 'city_2')
+        //     ->options($cities)->searchable()->displayUsingLabels()->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_1'], function (Select $f, NovaRequest $r, $data) {
+        //         ($data->add_line_1 ?? false) ? $f->show()->rules('required') : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Number::make('Quantity', 'quantity_2')
+        //     ->default(1)->min(1)->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_1'], function (Number $f, NovaRequest $r, $data) {
+        //         ($data->add_line_1 ?? false) ? $f->show()->rules(['required', 'min:1']) : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Boolean::make('Add Order', 'add_line_2')
+        //     ->fullWidth()
+        //     ->dependsOn(['add_line_1', 'add_line_3'], function (Boolean $f, NovaRequest $r, $data) {
+        //         if (!($data->add_line_1 ?? false) || ($data->add_line_3 ?? false)) {
+        //             $f->hide();
+        //         }
+        //     });
+
+        // // ══════════════════════════════════════════════════════════════════════
+        // // ORDER LINE 3
+        // // ══════════════════════════════════════════════════════════════════════
+        // $fields[] = Heading::make($this->lineHeadingHtml(3))->asHtml()
+        //     ->dependsOn(['add_line_2'], function (Heading $f, NovaRequest $r, $data) {
+        //         if (!($data->add_line_2 ?? false)) $f->hide();
+        //     });
+
+        // $fields[] = Select::make('Carrier', 'carrier_3')
+        //     ->options($carriers)->searchable()->displayUsingLabels()->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_2'], function (Select $f, NovaRequest $r, $data) {
+        //         ($data->add_line_2 ?? false) ? $f->show()->rules('required') : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Currency::make('Carrier Price', 'carrier_price_3')
+        //     ->fullWidth()
+        //     ->symbol('USD')
+        //     ->dependsOn(
+        //         ['add_line_2', 'carrier_3', 'buyer'],
+        //         function (Currency $f, NovaRequest $r, $data) use ($isAdmin, $buyerId) {
+        //             if (!($data->add_line_2 ?? false)) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+        //             $carrierId = $data->carrier_3 ?? null;
+        //             if (!$carrierId) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+
+        //             $carrier = \App\Models\Carrier::find($carrierId);
+        //             if (!$carrier) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+
+        //             $resolvedBuyerId = $isAdmin ? ($data->buyer ?? null) : $buyerId;
+        //             $price           = (float) $carrier->price;
+
+        //             if ($resolvedBuyerId) {
+        //                 $uc = \App\Models\UserCarrier::where('user_id', $resolvedBuyerId)
+        //                     ->where('carrier_id', $carrier->id)
+        //                     ->first(['rate']);
+        //                 if ($uc && $uc->rate > 0) {
+        //                     $price = (float) $uc->rate;
+        //                 }
+        //             }
+
+        //             $f->withMeta(['value' => $price, 'readonly' => true])->show();
+        //         }
+        //     );
+
+        // $fields[] = Select::make('City', 'city_3')
+        //     ->options($cities)->searchable()->displayUsingLabels()->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_2'], function (Select $f, NovaRequest $r, $data) {
+        //         ($data->add_line_2 ?? false) ? $f->show()->rules('required') : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Number::make('Quantity', 'quantity_3')
+        //     ->default(1)->min(1)->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_2'], function (Number $f, NovaRequest $r, $data) {
+        //         ($data->add_line_2 ?? false) ? $f->show()->rules(['required', 'min:1']) : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Boolean::make('Add Order', 'add_line_3')
+        //     ->fullWidth()
+        //     ->dependsOn(['add_line_2', 'add_line_4'], function (Boolean $f, NovaRequest $r, $data) {
+        //         if (!($data->add_line_2 ?? false) || ($data->add_line_4 ?? false)) {
+        //             $f->hide();
+        //         }
+        //     });
+
+        // // ══════════════════════════════════════════════════════════════════════
+        // // ORDER LINE 4
+        // // ══════════════════════════════════════════════════════════════════════
+        // $fields[] = Heading::make($this->lineHeadingHtml(4))->asHtml()
+        //     ->dependsOn(['add_line_3'], function (Heading $f, NovaRequest $r, $data) {
+        //         if (!($data->add_line_3 ?? false)) $f->hide();
+        //     });
+
+        // $fields[] = Select::make('Carrier', 'carrier_4')
+        //     ->options($carriers)->searchable()->displayUsingLabels()->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_3'], function (Select $f, NovaRequest $r, $data) {
+        //         ($data->add_line_3 ?? false) ? $f->show()->rules('required') : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Currency::make('Carrier Price', 'carrier_price_4')
+        //     ->fullWidth()
+        //     ->symbol('USD')
+        //     ->dependsOn(
+        //         ['add_line_3', 'carrier_4', 'buyer'],
+        //         function (Currency $f, NovaRequest $r, $data) use ($isAdmin, $buyerId) {
+        //             if (!($data->add_line_3 ?? false)) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+        //             $carrierId = $data->carrier_4 ?? null;
+        //             if (!$carrierId) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+
+        //             $carrier = \App\Models\Carrier::find($carrierId);
+        //             if (!$carrier) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+
+        //             $resolvedBuyerId = $isAdmin ? ($data->buyer ?? null) : $buyerId;
+        //             $price           = (float) $carrier->price;
+
+        //             if ($resolvedBuyerId) {
+        //                 $uc = \App\Models\UserCarrier::where('user_id', $resolvedBuyerId)
+        //                     ->where('carrier_id', $carrier->id)
+        //                     ->first(['rate']);
+        //                 if ($uc && $uc->rate > 0) {
+        //                     $price = (float) $uc->rate;
+        //                 }
+        //             }
+
+        //             $f->withMeta(['value' => $price, 'readonly' => true])->show();
+        //         }
+        //     );
+
+        // $fields[] = Select::make('City', 'city_4')
+        //     ->options($cities)->searchable()->displayUsingLabels()->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_3'], function (Select $f, NovaRequest $r, $data) {
+        //         ($data->add_line_3 ?? false) ? $f->show()->rules('required') : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Number::make('Quantity', 'quantity_4')
+        //     ->default(1)->min(1)->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_3'], function (Number $f, NovaRequest $r, $data) {
+        //         ($data->add_line_3 ?? false) ? $f->show()->rules(['required', 'min:1']) : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Boolean::make('Add Order', 'add_line_4')
+        //     ->fullWidth()
+        //     ->dependsOn(['add_line_3'], function (Boolean $f, NovaRequest $r, $data) {
+        //         if (!($data->add_line_3 ?? false)) {
+        //             $f->hide();
+        //         }
+        //     });
+
+        // // ══════════════════════════════════════════════════════════════════════
+        // // ORDER LINE 5
+        // // ══════════════════════════════════════════════════════════════════════
+        // $fields[] = Heading::make($this->lineHeadingHtml(5))->asHtml()
+        //     ->dependsOn(['add_line_4'], function (Heading $f, NovaRequest $r, $data) {
+        //         if (!($data->add_line_4 ?? false)) $f->hide();
+        //     });
+
+        // $fields[] = Select::make('Carrier', 'carrier_5')
+        //     ->options($carriers)->searchable()->displayUsingLabels()->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_4'], function (Select $f, NovaRequest $r, $data) {
+        //         ($data->add_line_4 ?? false) ? $f->show()->rules('required') : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Currency::make('Carrier Price', 'carrier_price_5')
+        //     ->fullWidth()
+        //     ->symbol('USD')
+        //     ->dependsOn(
+        //         ['add_line_4', 'carrier_5', 'buyer'],
+        //         function (Currency $f, NovaRequest $r, $data) use ($isAdmin, $buyerId) {
+        //             if (!($data->add_line_4 ?? false)) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+        //             $carrierId = $data->carrier_5 ?? null;
+        //             if (!$carrierId) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+
+        //             $carrier = \App\Models\Carrier::find($carrierId);
+        //             if (!$carrier) {
+        //                 $f->hide();
+        //                 return;
+        //             }
+
+        //             $resolvedBuyerId = $isAdmin ? ($data->buyer ?? null) : $buyerId;
+        //             $price           = (float) $carrier->price;
+
+        //             if ($resolvedBuyerId) {
+        //                 $uc = \App\Models\UserCarrier::where('user_id', $resolvedBuyerId)
+        //                     ->where('carrier_id', $carrier->id)
+        //                     ->first(['rate']);
+        //                 if ($uc && $uc->rate > 0) {
+        //                     $price = (float) $uc->rate;
+        //                 }
+        //             }
+
+        //             $f->withMeta(['value' => $price, 'readonly' => true])->show();
+        //         }
+        //     );
+
+        // $fields[] = Select::make('City', 'city_5')
+        //     ->options($cities)->searchable()->displayUsingLabels()->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_4'], function (Select $f, NovaRequest $r, $data) {
+        //         ($data->add_line_4 ?? false) ? $f->show()->rules('required') : $f->hide()->rules('nullable');
+        //     });
+
+        // $fields[] = Number::make('Quantity', 'quantity_5')
+        //     ->default(1)->min(1)->fullWidth()->nullable()
+        //     ->dependsOn(['add_line_4'], function (Number $f, NovaRequest $r, $data) {
+        //         ($data->add_line_4 ?? false) ? $f->show()->rules(['required', 'min:1']) : $f->hide()->rules('nullable');
+        //     });
+
+        return $fields;
+    }
+
+    private function lineHeadingHtml(int $i): string
+    {
+        return '<div style="font-size:13px;font-weight:700;color:#1e40af;background:#eff6ff;'
+            . 'padding:8px 12px;border-radius:8px;border-left:4px solid #2563eb;margin-top:4px;">'
+            . 'Order Line ' . $i . '</div>';
+    }
+}

@@ -1,0 +1,28 @@
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Hash;
+
+public function register(Request $request)
+{
+    $refCode = $request->query('ref');
+
+    $parentUser = null;
+
+    if ($refCode) {
+        $parentUser = User::where('referral_code', $refCode)->first();
+    }
+
+    $user = User::create([
+        'name' => $request->name,
+        'email' => $request->email,
+        'password' => Hash::make($request->password),
+        'parent_user_id' => $parentUser?->id
+    ]);
+
+    return redirect('/nova/login');
+}
+
+public function showRegister()
+{
+    return view('auth.register');
+}
