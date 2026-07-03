@@ -171,6 +171,58 @@ class Transaction extends Resource
                 ->showOnPreview()
                 ->hideFromIndex(),
 
+            // ── Summary stats for this email ──────────────────────────────────
+            Text::make('Total Orders', function () {
+                $email = optional($this->user)->email;
+                if (! $email) {
+                    return '—';
+                }
+                $count = \App\Models\Transaction::whereHas('user', function ($q) use ($email) {
+                    $q->where('email', $email);
+                })->count();
+                return (string) $count;
+            })
+                ->onlyOnDetail()
+                ->canSee(function ($request) {
+                    return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
+                }),
+
+            Text::make('Total Profit', function () {
+                $email = optional($this->user)->email;
+                if (! $email) {
+                    return '—';
+                }
+                $total = \App\Models\Transaction::whereHas('user', function ($q) use ($email) {
+                    $q->where('email', $email);
+                })->get()->sum(function ($transaction) {
+                    $wholeSalePrice = (float) optional(optional($transaction->order)->carrier)->cost ?? 0;
+                    $quantity = optional($transaction->order)->total_qty ?? 0;
+                    return (float) $transaction->charged_price - ($wholeSalePrice * $quantity);
+                });
+                return '$ ' . number_format($total, 2);
+            })
+                ->onlyOnDetail()
+                ->canSee(function ($request) {
+                    return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
+                }),
+
+            Text::make('Total Quantity', function () {
+                $email = optional($this->user)->email;
+                if (! $email) {
+                    return '—';
+                }
+                $total = \App\Models\Transaction::whereHas('user', function ($q) use ($email) {
+                    $q->where('email', $email);
+                })->get()->sum(function ($transaction) {
+                    return optional($transaction->order)->total_qty ?? 0;
+                });
+                return (string) $total;
+            })
+                ->onlyOnDetail()
+                ->canSee(function ($request) {
+                    return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
+                }),
+
             Text::make('Currency', 'currency')
                 ->onlyOnDetail(),
 
@@ -180,26 +232,26 @@ class Transaction extends Resource
                 ->step(0.00001)
                 ->required(),
 
-            Text::make('Older Transactions', function () {
+            Text::make('Same Email Transactions', function () {
                 $email = optional($this->user)->email;
                 if (! $email) {
                     return '—';
                 }
 
-                $older = \App\Models\Transaction::whereHas('user', function ($q) use ($email) {
+                $transactions = \App\Models\Transaction::whereHas('user', function ($q) use ($email) {
                     $q->where('email', $email);
                 })
-                    ->where('created_at', '<', $this->created_at)
                     ->orderByDesc('created_at')
-                    ->limit(5)
                     ->get();
 
-                if ($older->isEmpty()) {
+                if ($transactions->isEmpty()) {
                     return 'None';
                 }
 
-                return $older->map(function ($transaction) {
-                    return '<div>' . $transaction->created_at->format('Y-m-d H:i') . ' • ' . ($transaction->order ? $transaction->order->reference : 'N/A') . ' • $' . number_format($transaction->charged_price, 2) . '</div>';
+                return $transactions->map(function ($transaction) {
+                    $reference = $transaction->order?->reference ?? 'N/A';
+                    $userName = $transaction->user?->name ?? 'Unknown';
+                    return '<div>' . $transaction->created_at->format('Y-m-d H:i') . ' • ' . $userName . ' • ' . $reference . ' • $' . number_format($transaction->charged_price, 2) . ' • ' . ucfirst(strtolower($transaction->status)) . '</div>';
                 })->implode('');
             })
                 ->asHtml()
