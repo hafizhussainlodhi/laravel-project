@@ -153,7 +153,8 @@ class Transaction extends Resource
                 ->required()
                 ->rules(['required'])
                 ->showOnPreview()
-                ->hideFromIndex(),
+                ->hideFromIndex()
+                ->hideFromDetail(),
 
             BelongsTo::make('User', 'user', User::class)
                 ->sortable()
@@ -161,7 +162,8 @@ class Transaction extends Resource
                 ->required()
                 ->rules(['required'])
                 ->showOnPreview()
-                ->hideFromIndex(),
+                ->hideFromIndex()
+                ->hideFromDetail(),
 
             BelongsTo::make('Wallet', 'wallet', Wallet::class)
                 ->sortable()
@@ -169,7 +171,8 @@ class Transaction extends Resource
                 ->nullable()
                 ->rules(['nullable'])
                 ->showOnPreview()
-                ->hideFromIndex(),
+                ->hideFromIndex()
+                ->hideFromDetail(),
 
             Text::make('Same Email Transactions', function () {
                 $email = optional($this->user)->email;
@@ -258,7 +261,7 @@ class Transaction extends Resource
                 })->count();
                 return (string) $count;
             })
-                ->onlyOnDetail()
+                ->hideFromDetail()
                 ->canSee(function ($request) {
                     return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
                 }),
@@ -277,7 +280,7 @@ class Transaction extends Resource
                 });
                 return '$ ' . number_format($total, 2);
             })
-                ->onlyOnDetail()
+                ->hideFromDetail()
                 ->canSee(function ($request) {
                     return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
                 }),
@@ -294,25 +297,27 @@ class Transaction extends Resource
                 });
                 return (string) $total;
             })
-                ->onlyOnDetail()
+                ->hideFromDetail()
                 ->canSee(function ($request) {
                     return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
                 }),
 
             Text::make('Currency', 'currency')
-                ->onlyOnDetail(),
+                ->hideFromDetail(),
 
             Currency::make('Total', 'charged_price')
                 ->symbol(\App\Models\Transaction::USD)
                 ->context(new \Brick\Money\Context\CustomContext(3))
                 ->step(0.00001)
-                ->required(),
+                ->required()
+                ->hideFromDetail(),
 
             Select::make('Origin')
                 ->options(\App\Models\Transaction::GET_ORIGIN())
                 ->rules(['required'])
                 ->required()
-                ->displayUsingLabels(),
+                ->displayUsingLabels()
+                ->hideFromDetail(),
 
             Select::make('Status', 'status')
                 ->sortable()
@@ -320,13 +325,15 @@ class Transaction extends Resource
                 ->required()
                 ->options(\App\Models\Transaction::GET_STATUS())
                 ->displayUsingLabels()
-                ->filterable(),
+                ->filterable()
+                ->hideFromDetail(),
 
             DateTime::make('Created at', 'created_at')
                 ->exceptOnForms()
                 ->sortable()
                 ->displayUsing(fn($d) => $d->format('Y-m-d g:i:s A'))
-                ->hideFromIndex(),
+                ->hideFromIndex()
+                ->hideFromDetail(),
         ];
     }
 
