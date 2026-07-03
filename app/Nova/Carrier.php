@@ -72,7 +72,14 @@ class Carrier extends Resource
                         ->sortable()
                         ->rules('required', 'max:255'),
 
-                    Currency::make('Rate', 'price')
+                    Currency::make('Whole Sale Price', 'cost')
+                        ->symbol('USD')
+                        ->onlyOnForms()
+                        ->canSee(function ($request) {
+                            return $request->user()->role == \App\Models\User::SUPER_ADMINISTRATOR_ROLE;
+                        }),
+
+                    Currency::make('Hole Sell Price', 'cost')
                         ->symbol('USD')
                         ->onlyOnForms()
                         ->canSee(function ($request) {

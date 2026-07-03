@@ -16,6 +16,7 @@ class Carrier extends Model
         'image',
         'price',
         'is_active',
+        'cost',
     ];
 
     public function numbers()

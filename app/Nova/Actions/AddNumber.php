@@ -87,8 +87,8 @@ class AddNumber extends Action
             'area' => (int) $fields->area,
         ];
         Log::info('', $fieldData);
-        // Dispatch the job with serializable data
-        ProcessNumberImport::dispatch($records, $fieldData, (int) $userId, $authUser);
+        // Process the import immediately so numbers appear without needing a queue worker
+        ProcessNumberImport::dispatchSync($records, $fieldData, (int) $userId, $authUser);
 
         return Action::message('Numbers added successfully.');
     }

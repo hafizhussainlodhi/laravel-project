@@ -207,13 +207,16 @@ class Number extends Resource
         // // Seller — apne ya parent ke numbers
 
         if ($user->role == \App\Models\User::SELLER_ROLE) {
+            $ownerId = $user->parent_user_id ? $user->parent_user_id : $user->id;
 
-            // Log::info('hello');
-            return $query->whereIn('id', function ($q) use ($user) {
-                $q->select('oi.number_id')
-                    ->from('order_items as oi')
-                    ->join('orders as o', 'o.id', '=', 'oi.order_id')
-                    ->where('o.user_id', $user->id);
+            return $query->where(function ($query) use ($user, $ownerId) {
+                $query->where('user_id', $ownerId)
+                    ->orWhereIn('id', function ($q) use ($user) {
+                        $q->select('oi.number_id')
+                            ->from('order_items as oi')
+                            ->join('orders as o', 'o.id', '=', 'oi.order_id')
+                            ->where('o.user_id', $user->id);
+                    });
             });
         }
 

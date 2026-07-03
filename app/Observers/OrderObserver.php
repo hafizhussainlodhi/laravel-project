@@ -6,6 +6,7 @@ use App\Mail\OrderRefund;
 use App\Models\Number;
 use App\Models\Order;
 use App\Models\Transaction;
+use App\Models\User;
 use App\Models\WalletHistory;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
@@ -20,13 +21,6 @@ class OrderObserver
         $this->generateReference($order);
         if ($order->order_type == Order::ORDER_TYPE_BUY) {
             $this->genrateTotal($order);
-
-            $wallet = $order->user->wallet;
-            
-            if ($wallet && ($wallet->available <= 0 || $wallet->available < $order->total)) {
-                throw new \Exception('Insufficient wallet balance');
-
-            }
         }
     }
     /**

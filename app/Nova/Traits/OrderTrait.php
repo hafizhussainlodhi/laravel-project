@@ -190,6 +190,18 @@ trait OrderTrait
                 ->symbol('USD')
                 ->exceptOnForms(),
 
+            Currency::make('Whole Sale Price', function () {
+                return optional($this->carrier)->cost ?? 0;
+            })
+                ->symbol('USD')
+                ->sortable()
+                ->showOnIndex()
+                ->showOnDetail()
+                ->exceptOnForms()
+                ->canSee(function ($request) {
+                    return $request->user()->role == \App\Models\User::SUPER_ADMINISTRATOR_ROLE;
+                }),
+
             Currency::make('Sub Total', 'subtotal')
                 ->symbol('USD')
                 ->rules('required', 'numeric')
@@ -201,6 +213,17 @@ trait OrderTrait
                 ->rules('required', 'numeric')
                 ->required()
                 ->exceptOnForms(),
+
+            Currency::make('Profit', function () {
+                $carrierCost = optional($this->carrier)->cost ?? 0;
+                $totalCost = $carrierCost * ($this->total_qty ?? 0);
+                return $this->total - $totalCost;
+            })
+                ->symbol('USD')
+                ->exceptOnForms()
+                ->canSee(function ($request) {
+                    return $request->user()->role == \App\Models\User::SUPER_ADMINISTRATOR_ROLE;
+                }),
 
             Select::make('Status', 'status')
                 ->options(\App\Models\Order::GET_STATUS())
