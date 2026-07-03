@@ -9,10 +9,12 @@ use Laravel\Nova\Fields\Badge;
 use Laravel\Nova\Fields\BelongsTo;
 use Laravel\Nova\Fields\Currency;
 use Laravel\Nova\Fields\DateTime;
+use Laravel\Nova\Fields\HasMany;
 use Laravel\Nova\Fields\ID;
 use Laravel\Nova\Fields\Line;
 use Laravel\Nova\Fields\Select;
 use Laravel\Nova\Fields\Stack;
+use Illuminate\Support\Facades\DB;
 use Laravel\Nova\Fields\Text;
 use Laravel\Nova\Http\Requests\NovaRequest;
 
@@ -57,6 +59,17 @@ class Transaction extends Resource
                     ->onlyOnIndex(),
             ])->onlyOnIndex(),
 
+            // ── Latest-per-email grouping indicator ───────────────────────────
+            Text::make('Latest By Email', function () {
+                return optional(optional($this->resource)->user)->email
+                    ? ($this->resource->isLatestByEmail() ? 'Latest' : 'Older')
+                    : '—';
+            })
+                ->onlyOnIndex()
+                ->canSee(function ($request) {
+                    return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
+                }),
+
             // ── Index: Order info stack ───────────────────────────────────────
             Stack::make('Order \ Created At', 'order_id', [
 
@@ -82,29 +95,33 @@ class Transaction extends Resource
                 Line::make('Requested', fn() => optional($this->order)->total_qty ?? '—')
                     ->asHeading()
                     ->onlyOnIndex(),
-
-                // Line::make('Fulfilled', function () {
-                //     $success = optional($this->order)->success_qty;
-                //     $total   = optional($this->order)->total_qty;
-                //     if (is_null($success) || is_null($total)) return '—';
-                //     return $success . ' / ' . $total;
-                // })
-                //     ->asSmall()
-                //     ->extraClasses('text-80')
-                //     ->onlyOnIndex(),
             ])->onlyOnIndex(),
 
-            // ── Index: Price stack ────────────────────────────────────────────
-            // Stack::make('Amount', [
-            //     Line::make('Total', fn() => '$' . number_format((float) $this->charged_price, 2))
-            //         ->asHeading()
-            //         ->onlyOnIndex(),
+            // ── Index: Wholesale / Profit stack ─────────────────────────────────
+            Stack::make('Wholesale Profit', [
+                Line::make('Whole Sale Price', function () {
+                    $wholeSalePrice = optional(optional($this->order)->carrier)->cost;
+                    return $wholeSalePrice !== null ? '$' . number_format((float) $wholeSalePrice, 2) : '—';
+                })
+                    ->asHeading()
+                    ->onlyOnIndex()
+                    ->canSee(function ($request) {
+                        return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
+                    }),
 
-                // Line::make('Unit Price', fn() => '$' . number_format((float) optional($this->order)->price, 4) . ' / num')
-                //     ->asSmall()
-                //     ->extraClasses('text-80')
-                //     ->onlyOnIndex(),
-            // ])->onlyOnIndex(),
+                Line::make('Profit', function () {
+                    $wholeSalePrice = (float) optional(optional($this->order)->carrier)->cost;
+                    $quantity = optional($this->order)->total_qty ?? 0;
+                    $profit = (float) $this->charged_price - ($wholeSalePrice * $quantity);
+                    return '$' . number_format($profit, 2);
+                })
+                    ->asSmall()
+                    ->extraClasses('text-80')
+                    ->onlyOnIndex()
+                    ->canSee(function ($request) {
+                        return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
+                    }),
+            ])->onlyOnIndex(),
 
             // ── Index: Status + Platform stack ────────────────────────────────
             // Stack::make('Status', [
@@ -162,6 +179,34 @@ class Transaction extends Resource
                 ->context(new \Brick\Money\Context\CustomContext(3))
                 ->step(0.00001)
                 ->required(),
+
+            Text::make('Older Transactions', function () {
+                $email = optional($this->user)->email;
+                if (! $email) {
+                    return '—';
+                }
+
+                $older = \App\Models\Transaction::whereHas('user', function ($q) use ($email) {
+                    $q->where('email', $email);
+                })
+                    ->where('created_at', '<', $this->created_at)
+                    ->orderByDesc('created_at')
+                    ->limit(5)
+                    ->get();
+
+                if ($older->isEmpty()) {
+                    return 'None';
+                }
+
+                return $older->map(function ($transaction) {
+                    return '<div>' . $transaction->created_at->format('Y-m-d H:i') . ' • ' . ($transaction->order ? $transaction->order->reference : 'N/A') . ' • $' . number_format($transaction->charged_price, 2) . '</div>';
+                })->implode('');
+            })
+                ->asHtml()
+                ->onlyOnDetail()
+                ->canSee(function ($request) {
+                    return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
+                }),
 
             Select::make('Origin')
                 ->options(\App\Models\Transaction::GET_ORIGIN())
@@ -227,6 +272,15 @@ class Transaction extends Resource
                     'user',
                     fn($q) => $q->whereNull('parent_user_id')
                 );
+
+                // Show only the latest transaction for each email in the index.
+                $query->whereIn('id', function ($sub) {
+                    $sub->selectRaw('MAX(t2.id)')
+                        ->from('transactions as t2')
+                        ->join('users as u2', 'u2.id', '=', 't2.user_id')
+                        ->whereNull('u2.parent_user_id')
+                        ->groupBy('u2.email');
+                });
                 break;
 
             case UserModel::USER_ROLE:
@@ -241,6 +295,9 @@ class Transaction extends Resource
                 $query->whereRaw('1 = 0');
                 break;
         }
+
+        // Always show latest transaction first.
+        $query->latest('created_at');
 
         return $query;
     }

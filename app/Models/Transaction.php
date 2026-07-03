@@ -118,4 +118,22 @@ class Transaction extends Model
             static::ADMIN_DASHBOARD => ucwords(strtolower(str_replace('_', ' ', static::ADMIN_DASHBOARD))),
         ];
     }
+
+    public function isLatestByEmail(): bool
+    {
+        $email = optional($this->user)->email;
+
+        if (! $email) {
+            return false;
+        }
+
+        $latest = static::query()
+            ->selectRaw('MAX(transactions.id) as latest_id')
+            ->join('users', 'users.id', '=', 'transactions.user_id')
+            ->whereNull('users.parent_user_id')
+            ->where('users.email', $email)
+            ->value('latest_id');
+
+        return $latest === $this->id;
+    }
 }
