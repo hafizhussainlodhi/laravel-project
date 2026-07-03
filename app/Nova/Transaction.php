@@ -171,6 +171,82 @@ class Transaction extends Resource
                 ->showOnPreview()
                 ->hideFromIndex(),
 
+            Text::make('Same Email Transactions', function () {
+                $email = optional($this->user)->email;
+                if (! $email) {
+                    return '—';
+                }
+
+                $transactions = \App\Models\Transaction::whereHas('user', function ($q) use ($email) {
+                    $q->where('email', $email);
+                })
+                    ->orderByDesc('created_at')
+                    ->get();
+
+                if ($transactions->isEmpty()) {
+                    return 'None';
+                }
+
+                $totalProfit = 0;
+                $rows = '';
+
+                foreach ($transactions as $transaction) {
+                    $reference = $transaction->order?->reference ?? 'N/A';
+                    $userName = $transaction->user?->name ?? 'Unknown';
+                    $date = $transaction->created_at->format('Y-m-d H:i');
+                    $total = number_format($transaction->charged_price, 2);
+                    $status = ucfirst(strtolower($transaction->status));
+                    $quantity = optional($transaction->order)->total_qty ?? 0;
+                    $wholeSalePrice = (float) optional(optional($transaction->order)->carrier)->cost ?? 0;
+                    $profit = (float) $transaction->charged_price - ($wholeSalePrice * $quantity);
+                    $totalProfit += $profit;
+                    $profitFormatted = number_format($profit, 2);
+
+                    $rows .= '<tr style="border-bottom: 1px solid #e0e0e0;">
+                        <td style="padding: 8px; text-align: left;">' . $date . '</td>
+                        <td style="padding: 8px; text-align: left;">' . $userName . '</td>
+                        <td style="padding: 8px; text-align: left;">' . $reference . '</td>
+                        <td style="padding: 8px; text-align: center;">' . $quantity . '</td>
+                        <td style="padding: 8px; text-align: right;">$' . $total . '</td>
+                        <td style="padding: 8px; text-align: right;">$' . $profitFormatted . '</td>
+                        <td style="padding: 8px; text-align: left;">' . $status . '</td>
+                    </tr>';
+                }
+
+                $totalFormatted = number_format($totalProfit, 2);
+                $rows .= '<tr style="background-color: #f5f5f5; border-top: 2px solid #333;">
+                    <td style="padding: 8px; font-weight: bold; text-align: left;"></td>
+                    <td style="padding: 8px; font-weight: bold;"></td>
+                    <td style="padding: 8px; font-weight: bold;">TOTAL</td>
+                    <td style="padding: 8px; font-weight: bold; text-align: center;">—</td>
+                    <td style="padding: 8px; font-weight: bold; text-align: right;">—</td>
+                    <td style="padding: 8px; font-weight: bold; text-align: right;">$' . $totalFormatted . '</td>
+                    <td style="padding: 8px;"></td>
+                </tr>';
+
+                return '<table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                    <thead style="background-color: #f9f9f9; border-bottom: 2px solid #333;">
+                        <tr>
+                            <th style="padding: 10px; text-align: left; font-weight: bold;">Date</th>
+                            <th style="padding: 10px; text-align: left; font-weight: bold;">User</th>
+                            <th style="padding: 10px; text-align: left; font-weight: bold;">Order</th>
+                            <th style="padding: 10px; text-align: center; font-weight: bold;">Quantity</th>
+                            <th style="padding: 10px; text-align: right; font-weight: bold;">Total</th>
+                            <th style="padding: 10px; text-align: right; font-weight: bold;">Profit</th>
+                            <th style="padding: 10px; text-align: left; font-weight: bold;">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ' . $rows . '
+                    </tbody>
+                </table>';
+            })
+                ->asHtml()
+                ->onlyOnDetail()
+                ->canSee(function ($request) {
+                    return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
+                }),
+
             // ── Summary stats for this email ──────────────────────────────────
             Text::make('Total Orders', function () {
                 $email = optional($this->user)->email;
@@ -231,34 +307,6 @@ class Transaction extends Resource
                 ->context(new \Brick\Money\Context\CustomContext(3))
                 ->step(0.00001)
                 ->required(),
-
-            Text::make('Same Email Transactions', function () {
-                $email = optional($this->user)->email;
-                if (! $email) {
-                    return '—';
-                }
-
-                $transactions = \App\Models\Transaction::whereHas('user', function ($q) use ($email) {
-                    $q->where('email', $email);
-                })
-                    ->orderByDesc('created_at')
-                    ->get();
-
-                if ($transactions->isEmpty()) {
-                    return 'None';
-                }
-
-                return $transactions->map(function ($transaction) {
-                    $reference = $transaction->order?->reference ?? 'N/A';
-                    $userName = $transaction->user?->name ?? 'Unknown';
-                    return '<div>' . $transaction->created_at->format('Y-m-d H:i') . ' • ' . $userName . ' • ' . $reference . ' • $' . number_format($transaction->charged_price, 2) . ' • ' . ucfirst(strtolower($transaction->status)) . '</div>';
-                })->implode('');
-            })
-                ->asHtml()
-                ->onlyOnDetail()
-                ->canSee(function ($request) {
-                    return $request->user()->role == UserModel::SUPER_ADMINISTRATOR_ROLE;
-                }),
 
             Select::make('Origin')
                 ->options(\App\Models\Transaction::GET_ORIGIN())
