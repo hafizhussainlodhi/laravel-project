@@ -191,6 +191,8 @@ class Transaction extends Resource
                 }
 
                 $totalProfit = 0;
+                $totalQuantity = 0;
+                $totalPrice = 0;
                 $rows = '';
 
                 foreach ($transactions as $transaction) {
@@ -203,6 +205,8 @@ class Transaction extends Resource
                     $wholeSalePrice = (float) optional(optional($transaction->order)->carrier)->cost ?? 0;
                     $profit = (float) $transaction->charged_price - ($wholeSalePrice * $quantity);
                     $totalProfit += $profit;
+                    $totalQuantity += $quantity;
+                    $totalPrice += (float) $transaction->charged_price;
                     $profitFormatted = number_format($profit, 2);
 
                     $rows .= '<tr style="border-bottom: 1px solid #e0e0e0;">
@@ -217,12 +221,13 @@ class Transaction extends Resource
                 }
 
                 $totalFormatted = number_format($totalProfit, 2);
+                $totalPriceFormatted = number_format($totalPrice, 2);
                 $rows .= '<tr style="background-color: #f5f5f5; border-top: 2px solid #333;">
                     <td style="padding: 8px; font-weight: bold; text-align: left;"></td>
                     <td style="padding: 8px; font-weight: bold;"></td>
                     <td style="padding: 8px; font-weight: bold;">TOTAL</td>
-                    <td style="padding: 8px; font-weight: bold; text-align: center;">—</td>
-                    <td style="padding: 8px; font-weight: bold; text-align: right;">—</td>
+                    <td style="padding: 8px; font-weight: bold; text-align: center;">' . $totalQuantity . '</td>
+                    <td style="padding: 8px; font-weight: bold; text-align: right;">$' . $totalPriceFormatted . '</td>
                     <td style="padding: 8px; font-weight: bold; text-align: right;">$' . $totalFormatted . '</td>
                     <td style="padding: 8px;"></td>
                 </tr>';
